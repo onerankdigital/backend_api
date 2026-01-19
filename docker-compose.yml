@@ -1,0 +1,329 @@
+services:
+  # Databases
+  postgres:
+    image: postgres:15-alpine
+    container_name: lead_platform_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-leaduser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-leadpass}
+      POSTGRES_DB: ${POSTGRES_DB:-leadplatform}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-leaduser}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: lead_platform_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API Gateway
+  api_gateway:
+    build:
+      context: ./services/api_gateway
+      dockerfile: Dockerfile
+    container_name: lead_platform_gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - AUTH_SERVICE_URL=http://auth_service:8001
+      - CLIENT_SERVICE_URL=http://client_service:8002
+      - USER_SERVICE_URL=http://user_service:8003
+      - LEAD_SERVICE_URL=http://lead_service:8004
+      - PRODUCT_SERVICE_URL=http://product_service:8005
+      - CONTENT_SERVICE_URL=http://content_service:8010
+      - INTEGRATION_SERVICE_URL=http://integration_service:8006
+      - WEBHOOK_SERVICE_URL=http://webhook_service:8007
+      - PERMISSION_SERVICE_URL=http://permission_service:8008
+      - HIERARCHY_SERVICE_URL=http://hierarchy_service:8009
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_ALGORITHM=HS256
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/api_gateway:/app
+      - ./alembic:/app/alembic
+      - ./shared:/app/shared
+      - ./alembic.ini:/app/alembic.ini
+    working_dir: /app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Auth Service
+  auth_service:
+    build:
+      context: ./services/auth_service
+      dockerfile: Dockerfile
+    container_name: lead_platform_auth
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_ALGORITHM=HS256
+      - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
+      - JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
+      - BCRYPT_ROUNDS=12
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/auth_service:/app
+      - ./shared:/app/shared
+
+  # Client Service
+  client_service:
+    build:
+      context: ./services/client_service
+      dockerfile: Dockerfile
+    container_name: lead_platform_client
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/client_service:/app
+      - ./shared:/app/shared
+
+  # User Service
+  user_service:
+    build:
+      context: ./services/user_service
+      dockerfile: Dockerfile
+    container_name: lead_platform_user
+    ports:
+      - "8003:8003"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+      - AUTH_SERVICE_URL=http://auth_service:8001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/user_service:/app
+      - ./shared:/app/shared
+
+  # Lead Service
+  lead_service:
+    build:
+      context: ./services/lead_service
+      dockerfile: Dockerfile
+    container_name: lead_platform_lead
+    ports:
+      - "8004:8004"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+      - INTEGRATION_SERVICE_URL=http://integration_service:8006
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/lead_service:/app
+      - ./shared:/app/shared
+
+  # Product Service
+  product_service:
+    build:
+      context: ./services/product_service
+      dockerfile: Dockerfile
+    container_name: lead_platform_product
+    ports:
+      - "8005:8005"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/product_service:/app
+      - ./shared:/app/shared
+      - ./uploads:/app/uploads
+    working_dir: /app
+    command: uvicorn main:app --host 0.0.0.0 --port 8005 --reload
+
+  # Content Service
+  content_service:
+    build:
+      context: ./services/content_service
+      dockerfile: Dockerfile
+    container_name: lead_platform_content
+    ports:
+      - "8010:8010"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/content_service:/app
+      - ./shared:/app/shared
+    working_dir: /app
+    command: uvicorn main:app --host 0.0.0.0 --port 8010 --reload
+
+  # Integration Service
+  integration_service:
+    build:
+      context: ./services/integration_service
+      dockerfile: Dockerfile
+    container_name: lead_platform_integration
+    ports:
+      - "8006:8006"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_WHATSAPP_FROM=${TWILIO_WHATSAPP_FROM}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL:-${SMTP_USER}}
+      - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - GOOGLE_SERVICE_ACCOUNT_FILE=/app/service_account.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/integration_service:/app
+      - ./shared:/app/shared
+
+  # Webhook Service
+  webhook_service:
+    build:
+      context: ./services/webhook_service
+      dockerfile: Dockerfile
+    container_name: lead_platform_webhook
+    ports:
+      - "8007:8007"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/2
+      - META_APP_SECRET=${META_APP_SECRET}
+      - LEAD_SERVICE_URL=http://lead_service:8004
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/webhook_service:/app
+      - ./shared:/app/shared
+
+  # Permission Service
+  permission_service:
+    build:
+      context: ./services/permission_service
+      dockerfile: Dockerfile
+    container_name: lead_platform_permission
+    ports:
+      - "8008:8008"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/permission_service:/app
+      - ./shared:/app/shared
+    command: uvicorn main:app --host 0.0.0.0 --port 8008 --reload
+
+  # Hierarchy Service
+  hierarchy_service:
+    build:
+      context: ./services/hierarchy_service
+      dockerfile: Dockerfile
+    container_name: lead_platform_hierarchy
+    ports:
+      - "8009:8009"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/hierarchy_service:/app
+      - ./shared:/app/shared
+    command: uvicorn main:app --host 0.0.0.0 --port 8009 --reload
+
+  # Celery Worker
+  celery_worker:
+    build:
+      context: ./services/celery_worker
+      dockerfile: Dockerfile
+    container_name: lead_platform_celery
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-leaduser}:${POSTGRES_PASSWORD:-leadpass}@postgres:5432/${POSTGRES_DB:-leadplatform}
+      - REDIS_URL=redis://redis:6379/0
+      - INTEGRATION_SERVICE_URL=http://integration_service:8006
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_WHATSAPP_FROM=${TWILIO_WHATSAPP_FROM}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL:-${SMTP_USER}}
+      - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - GOOGLE_SERVICE_ACCOUNT_FILE=/app/service_account.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/celery_worker:/app
+      - ./shared:/app/shared
+    command: celery -A tasks worker --loglevel=info
+
+volumes:
+  postgres_data:
+  redis_data:
+
