@@ -951,6 +951,50 @@ async def list_users(request: Request, current_user: dict = Depends(get_current_
         )
 
 
+@app.put("/api/auth/users/{user_id}")
+async def update_user(
+    user_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update user (admin only)"""
+    auth_header = request.headers.get("Authorization", "")
+    try:
+        body = await request.json()
+        logger.info(f"PUT /api/auth/users/{user_id} - Updating user for admin: {current_user.get('user_id')}")
+        result = await auth_client.put(f"/users/{user_id}", json=body, headers={"Authorization": auth_header})
+        return JSONResponse(
+            content=result,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Auth service error: {e}")
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content=e.response.json() if e.response.content else {"detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Update user error: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "error": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+
 @app.delete("/api/auth/users/{user_id}")
 async def delete_user(
     user_id: str,
