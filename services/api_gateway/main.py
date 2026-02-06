@@ -6,7 +6,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, or_
 from typing import Optional, Dict, Any, List
 import sys
 import os
@@ -184,6 +184,83 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         return payload
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+
+async def has_cross_client_permission(
+    user_id: str,
+    method: str,
+    endpoint_path: str,
+    db: AsyncSession
+) -> bool:
+    """
+    Check if user has a permission that grants cross-client access for any endpoint.
+    
+    Checks for:
+    1. Special permission path pattern: /api/{resource}/all (e.g., /api/leads/all, /api/transactions/all)
+    2. Permission description contains cross-client keywords (e.g., "cross-client", "all clients", "all enquiries")
+    
+    This allows granting admin-like access to specific endpoints without being a full admin.
+    """
+    # Get all user's active user_clients
+    query = select(UserClient).where(
+        and_(
+            UserClient.user_id == uuid.UUID(user_id),
+            UserClient.status == "active"
+        )
+    )
+    result = await db.execute(query)
+    user_clients = result.scalars().all()
+    
+    if not user_clients:
+        return False
+    
+    # Normalize endpoint path (remove trailing slash, handle {id} patterns)
+    normalized_endpoint = endpoint_path.rstrip('/')
+    # Convert /api/leads/{id} to /api/leads for matching
+    import re
+    normalized_endpoint = re.sub(r'/\{[^}]+\}$', '', normalized_endpoint)
+    
+    # Build cross-client permission path pattern
+    # /api/leads -> /api/leads/all
+    # /api/transactions -> /api/transactions/all
+    cross_client_path = f"{normalized_endpoint}/all"
+    
+    # Cross-client keywords to check in permission description
+    cross_client_keywords = [
+        "cross-client", "cross client", "all clients", "all enquiries", 
+        "all transactions", "all leads", "global access", "admin access",
+        "view all", "access all"
+    ]
+    
+    # Check if any of the user's roles have cross-client permission
+    for uc in user_clients:
+        # Get all permissions for this role with matching method
+        result = await db.execute(
+            select(Permission)
+            .join(RolePermission, Permission.id == RolePermission.permission_id)
+            .where(
+                and_(
+                    RolePermission.role_id == uc.role_id,
+                    Permission.method == method.upper()
+                )
+            )
+        )
+        permissions = result.scalars().all()
+        
+        for permission in permissions:
+            # Check for special cross-client path pattern
+            if permission.path == cross_client_path:
+                logger.info(f"User {user_id} has cross-client permission via path pattern: {permission.path}")
+                return True
+            
+            # Check if permission path matches endpoint and description contains cross-client keywords
+            if permission.path == normalized_endpoint and permission.description:
+                description_lower = permission.description.lower()
+                if any(keyword in description_lower for keyword in cross_client_keywords):
+                    logger.info(f"User {user_id} has cross-client permission via description: {permission.path} - {permission.description}")
+                    return True
+    
+    return False
 
 
 async def check_access_decision(
@@ -513,7 +590,9 @@ async def permission_middleware(request: Request, call_next):
     # Only catch token decoding errors here, not endpoint handler errors
     try:
         token = auth_header.replace("Bearer ", "")
+        logger.info(f"Decoding token for path: {request.url.path}")
         payload = decode_token(token)
+        logger.info(f"Token decoded successfully for path: {request.url.path}")
     except ValueError as e:
         # Token decoding failed - invalid token
         logger.error(f"Token decode error: {str(e)}", exc_info=True)
@@ -533,18 +612,33 @@ async def permission_middleware(request: Request, call_next):
     try:
         user_id = payload.get("user_id")
         is_admin_value = payload.get("is_admin", False)
+        
+        # Log the raw JWT payload for debugging
+        logger.info(f"JWT payload for user {user_id} on {request.method} {request.url.path}: is_admin={is_admin_value} (type: {type(is_admin_value)})")
+        
         # Handle both boolean and string values for is_admin
         # JWT payload might have "true"/"false" as strings or boolean True/False
-        is_admin = is_admin_value == True or is_admin_value == "true" or is_admin_value == "True"
+        # Also handle case where it might be the string "true" (not boolean)
+        is_admin = False
+        if isinstance(is_admin_value, bool):
+            is_admin = is_admin_value == True
+        elif isinstance(is_admin_value, str):
+            # Handle string values: "true", "True", "TRUE", "1", "yes", etc.
+            is_admin = str(is_admin_value).lower().strip() in ("true", "1", "yes", "on")
+            logger.info(f"Admin check: is_admin_value is string '{is_admin_value}', converted to {is_admin}")
+        else:
+            # For any other type, try to convert to boolean
+            is_admin = bool(is_admin_value)
+            logger.info(f"Admin check: is_admin_value is {type(is_admin_value)} '{is_admin_value}', converted to {is_admin}")
         
-        # Admin bypass - admins have full access
+        logger.info(f"Admin check result for user {user_id}: is_admin={is_admin} (original value: {is_admin_value}, type: {type(is_admin_value)})")
+        
+        # If JWT indicates admin, bypass immediately
         if is_admin:
             logger.info(f"Admin user {user_id} bypassing permission check for {request.method} {request.url.path}")
             request.state.user_id = user_id
             request.state.is_admin = True
             request.state.client_id = request.query_params.get("client_id")
-            # For admin users, let the endpoint handler process the request
-            # Don't catch exceptions from endpoint handlers - let FastAPI handle them
             response = await call_next(request)
             return response
         
@@ -553,15 +647,23 @@ async def permission_middleware(request: Request, call_next):
         
         # Normalize path for permission matching (same logic as permission_registry.py)
         # Convert path parameters to {id} format for matching
-        # e.g., /api/clients/123 -> /api/clients/{id}
+        # e.g., /api/clients/123e4567-e89b-12d3-a456-426614174000 -> /api/clients/{id}
         import re
         path = request.url.path
         normalized_path = path
-        # Replace UUID patterns with {id} for consistency
-        normalized_path = re.sub(r'/[a-f0-9-]{36}', '/{id}', normalized_path)
-        # Replace last segment with {id} if it looks like an ID and path doesn't already have {id}
-        if '{' not in normalized_path:
-            normalized_path = re.sub(r'/([^/]+)$', '/{id}', normalized_path)
+
+        # Only normalize if the path contains actual ID values (UUIDs or numeric IDs)
+        # Replace UUID patterns with {id}
+        normalized_path = re.sub(r'/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', '/{id}', normalized_path)
+
+        # Replace numeric IDs at the end (e.g., /api/clients/123 -> /api/clients/{id})
+        # But NOT plain words like /api/leads or /api/clients
+        # Only match if the last segment is purely numeric or looks like an ID
+        if not normalized_path.endswith(('leads', 'clients', 'transactions', 'users', 'roles', 'permissions',
+                                          'products', 'industries', 'about-us', 'contact-details', 'api-keys',
+                                          'user-clients', 'endpoints', 'search', 'captcha', 'csrf', 'token')):
+            # Replace last segment with {id} if it's numeric or UUID-like
+            normalized_path = re.sub(r'/(\d+|[a-f0-9-]{36})$', '/{id}', normalized_path)
         method = request.method
         
         # Get database session for permission checking
@@ -570,6 +672,38 @@ async def permission_middleware(request: Request, call_next):
         has_access = False
         
         async for db in get_db():
+            # If JWT doesn't indicate admin, check database as fallback (in case token is stale)
+            # This handles cases where user was made admin after token was issued
+            if not is_admin:
+                try:
+                    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+                    user = result.scalar_one_or_none()
+                    if user:
+                        # Check both string and boolean values
+                        user_is_admin = False
+                        if isinstance(user.is_admin, bool):
+                            user_is_admin = user.is_admin
+                        elif isinstance(user.is_admin, str):
+                            user_is_admin = user.is_admin.lower() in ("true", "1", "yes")
+                        else:
+                            user_is_admin = bool(user.is_admin)
+                        
+                        if user_is_admin:
+                            is_admin = True
+                            logger.info(f"User {user_id} is admin (verified from database: is_admin={user.is_admin}), bypassing permission check")
+                except Exception as e:
+                    logger.warning(f"Failed to check admin status from database: {e}", exc_info=True)
+            
+            # Admin bypass - admins have full access (check again after database lookup)
+            if is_admin:
+                logger.info(f"Admin user {user_id} bypassing permission check for {request.method} {request.url.path}")
+                request.state.user_id = user_id
+                request.state.is_admin = True
+                request.state.client_id = client_id
+                # For admin users, let the endpoint handler process the request
+                # Don't catch exceptions from endpoint handlers - let FastAPI handle them
+                response = await call_next(request)
+                return response
             # Log permission check attempt
             logger.info(f"Permission check: user_id={user_id}, method={method}, path={path}, normalized_path={normalized_path}, client_id={client_id}")
             
@@ -596,6 +730,10 @@ async def permission_middleware(request: Request, call_next):
                     has_access = False
                     for uc in user_clients:
                         logger.info(f"Checking role {uc.role_id} for permission {method} {normalized_path}")
+
+                        # Check for exact match OR cross-client variant (/api/leads or /api/leads/all)
+                        cross_client_path = f"{normalized_path}/all"
+
                         result = await db.execute(
                             select(Permission)
                             .join(RolePermission, Permission.id == RolePermission.permission_id)
@@ -603,7 +741,10 @@ async def permission_middleware(request: Request, call_next):
                                 and_(
                                     RolePermission.role_id == uc.role_id,
                                     Permission.method == method.upper(),
-                                    Permission.path == normalized_path
+                                    or_(
+                                        Permission.path == normalized_path,
+                                        Permission.path == cross_client_path
+                                    )
                                 )
                             )
                         )
@@ -613,7 +754,7 @@ async def permission_middleware(request: Request, call_next):
                             has_access = True
                             break
                         else:
-                            logger.warning(f"No permission {method} {normalized_path} found for role {uc.role_id}")
+                            logger.warning(f"No permission {method} {normalized_path} or {cross_client_path} found for role {uc.role_id}")
                 
                 if not has_access:
                     # Log all permissions for this role for debugging
@@ -804,6 +945,54 @@ async def list_users(request: Request, current_user: dict = Depends(get_current_
         )
 
 
+@app.delete("/api/auth/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete user (admin only) - Admins can delete any user including other admins"""
+    # Check if user is admin
+    if not current_user.get("is_admin"):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Only administrators can delete users"},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+    
+    auth_header = request.headers.get("Authorization", "")
+    try:
+        result = await auth_client.delete(f"/users/{user_id}", headers={"Authorization": auth_header})
+        return result
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Auth service error: {e}")
+        error_content = e.response.json() if e.response.content else {"detail": str(e)}
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content=error_content,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Delete user error: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "error": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+
 @app.get("/api/auth/me")
 async def get_me(request: Request, current_user: dict = Depends(get_current_user)):
     """Get current user"""
@@ -842,11 +1031,49 @@ async def get_my_permissions(current_user: dict = Depends(get_current_user)):
     try:
         user_id = current_user.get("user_id")
         is_admin_value = current_user.get("is_admin", False)
+        
         # Handle both boolean and string values for is_admin
-        is_admin = is_admin_value == True or is_admin_value == "true" or is_admin_value == "True"
+        # JWT might have it as string "true" if database has it as string
+        is_admin = False
+        if isinstance(is_admin_value, bool):
+            is_admin = is_admin_value == True
+        elif isinstance(is_admin_value, str):
+            # Handle string values: "true", "True", "TRUE", "1", "yes", etc.
+            is_admin = str(is_admin_value).lower().strip() in ("true", "1", "yes", "on")
+            logger.info(f"/me/permissions: is_admin_value is string '{is_admin_value}', converted to {is_admin}")
+        else:
+            # For any other type, try to convert to boolean
+            is_admin = bool(is_admin_value)
+            logger.info(f"/me/permissions: is_admin_value is {type(is_admin_value)} '{is_admin_value}', converted to {is_admin}")
+        
+        logger.info(f"/me/permissions: Admin check for user {user_id}: is_admin={is_admin} (original: {is_admin_value}, type: {type(is_admin_value)})")
+        
+        # If JWT doesn't indicate admin, check database as fallback
+        if not is_admin:
+            async for db in get_db():
+                try:
+                    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+                    user = result.scalar_one_or_none()
+                    if user:
+                        # Check both string and boolean values
+                        user_is_admin = False
+                        if isinstance(user.is_admin, bool):
+                            user_is_admin = user.is_admin
+                        elif isinstance(user.is_admin, str):
+                            user_is_admin = user.is_admin.lower() in ("true", "1", "yes")
+                        else:
+                            user_is_admin = bool(user.is_admin)
+                        
+                        if user_is_admin:
+                            is_admin = True
+                            logger.info(f"User {user_id} is admin (verified from database in /me/permissions)")
+                except Exception as e:
+                    logger.warning(f"Failed to check admin status from database in /me/permissions: {e}")
+                break
         
         # Admin has all permissions (return empty list - frontend will handle as "all access")
         if is_admin:
+            logger.info(f"Admin user {user_id} - returning empty permissions list")
             return JSONResponse(
                 content={"permissions": [], "is_admin": True},
                 headers={
@@ -992,12 +1219,73 @@ async def get_premium_clients():
 
 @app.get("/api/clients")
 async def list_clients(current_user: dict = Depends(get_current_user)):
-    """List clients"""
+    """List clients - filtered by user's connected clients unless they have cross-client permission"""
     try:
-        logger.info(f"Attempting to connect to CLIENT_SERVICE_URL: {CLIENT_SERVICE_URL}")
-        result = await client_client.get("/clients")
-        logger.info(f"Successfully retrieved clients from {CLIENT_SERVICE_URL}")
-        return result
+        user_id = current_user.get("user_id")
+        is_admin = current_user.get("is_admin", False)
+
+        # Admin users can see all clients
+        if is_admin:
+            logger.info(f"Admin user {user_id} fetching all clients")
+            result = await client_client.get("/clients")
+            return result
+
+        # Check for cross-client permission
+        async for db in get_db():
+            has_cross_client_access = await has_cross_client_permission(
+                user_id=user_id,
+                method="GET",
+                endpoint_path="/api/clients",
+                db=db
+            )
+
+            # If user has cross-client permission, return all clients
+            if has_cross_client_access:
+                logger.info(f"User {user_id} has cross-client permission for clients")
+                result = await client_client.get("/clients")
+                return result
+
+            # Get user's connected clients
+            query = select(UserClient).where(
+                and_(
+                    UserClient.user_id == uuid.UUID(user_id),
+                    UserClient.status == "active"
+                )
+            )
+            result = await db.execute(query)
+            user_clients = result.scalars().all()
+
+            if not user_clients:
+                logger.warning(f"User {user_id} has no active user_clients")
+                return JSONResponse(
+                    content=[],
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                        "Access-Control-Allow-Headers": "*",
+                    }
+                )
+
+            # Get list of client_ids user is connected to
+            user_client_ids = [uc.client_id for uc in user_clients]
+            logger.info(f"User {user_id} filtering clients to: {user_client_ids}")
+
+            # Fetch all clients from service
+            all_clients_result = await client_client.get("/clients")
+            all_clients = all_clients_result if isinstance(all_clients_result, list) else []
+
+            # Filter to only user's connected clients
+            filtered_clients = [c for c in all_clients if c.get("client_id") in user_client_ids]
+
+            return JSONResponse(
+                content=filtered_clients,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                }
+            )
+            break
     except httpx.ConnectError as e:
         logger.error(f"Connection error to CLIENT_SERVICE_URL ({CLIENT_SERVICE_URL}): {e}")
         return JSONResponse(
@@ -1425,18 +1713,151 @@ async def ingest_lead(request: Request):
 
 
 @app.get("/api/leads")
-async def list_leads(current_user: dict = Depends(get_current_user)):
-    """List leads"""
+async def list_leads(
+    client_id: Optional[str] = None,
+    source: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    current_user: dict = Depends(get_current_user)
+):
+    """List leads - automatically filtered to user's connected clients"""
     try:
-        result = await lead_client.get("/leads")
-        return JSONResponse(
-            content=result if result else [],
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-                "Access-Control-Allow-Headers": "*",
-            }
-        )
+        user_id = current_user.get("user_id")
+        is_admin = current_user.get("is_admin", False)
+        
+        # Admin users can see all leads
+        if is_admin:
+            params = {}
+            if client_id:
+                params["client_id"] = client_id
+            if source:
+                params["source"] = source
+            params["skip"] = skip
+            params["limit"] = limit
+            
+            result = await lead_client.get("/leads", params=params)
+            return JSONResponse(
+                content=result if result else [],
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                }
+            )
+        
+        # Non-admin users: Check if they have cross-client permission
+        async for db in get_db():
+            # Check for special permission to view all leads across all clients
+            has_cross_client_access = await has_cross_client_permission(
+                user_id=user_id,
+                method="GET",
+                endpoint_path="/api/leads",
+                db=db
+            )
+            
+            # If user has cross-client permission, return all leads (like admin)
+            if has_cross_client_access:
+                params = {}
+                if client_id:
+                    params["client_id"] = client_id
+                if source:
+                    params["source"] = source
+                params["skip"] = skip
+                params["limit"] = limit
+                
+                result = await lead_client.get("/leads", params=params)
+                return JSONResponse(
+                    content=result if result else [],
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                        "Access-Control-Allow-Headers": "*",
+                    }
+                )
+            
+            # Normal flow: Get their connected client_ids
+            query = select(UserClient).where(
+                and_(
+                    UserClient.user_id == uuid.UUID(user_id),
+                    UserClient.status == "active"
+                )
+            )
+            result = await db.execute(query)
+            user_clients = result.scalars().all()
+            
+            if not user_clients:
+                # User has no connected clients, return empty list
+                return JSONResponse(
+                    content=[],
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                        "Access-Control-Allow-Headers": "*",
+                    }
+                )
+            
+            # Get list of client_ids user is connected to
+            user_client_ids = [uc.client_id for uc in user_clients]
+            
+            # If client_id is provided, verify user has access to it
+            if client_id:
+                if client_id not in user_client_ids:
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "You do not have access to this client's data"},
+                        headers={
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                            "Access-Control-Allow-Headers": "*",
+                        }
+                    )
+                # User has access to this specific client - fetch leads for this client only
+                params = {"client_id": client_id}
+                if source:
+                    params["source"] = source
+                params["skip"] = skip
+                params["limit"] = limit
+                
+                all_leads = await lead_client.get("/leads", params=params)
+                filtered_leads = all_leads if all_leads else []
+            else:
+                # Fetch leads for each of the user's connected clients in parallel
+                # Then combine, sort, and paginate
+                import asyncio
+                
+                tasks = []
+                for user_client_id in user_client_ids:
+                    params = {"client_id": user_client_id, "limit": 1000}  # Get enough leads per client
+                    if source:
+                        params["source"] = source
+                    tasks.append(lead_client.get("/leads", params=params))
+                
+                # Execute all requests in parallel
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Combine leads from all clients
+                all_leads = []
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Error fetching leads: {result}")
+                        continue
+                    if result:
+                        all_leads.extend(result if isinstance(result, list) else [result])
+                
+                # Sort by created_at descending (most recent first)
+                all_leads.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+                
+                # Apply pagination
+                filtered_leads = all_leads[skip:skip + limit]
+            
+            return JSONResponse(
+                content=filtered_leads,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                }
+            )
     except httpx.HTTPStatusError as e:
         logger.error(f"Lead service error: {e}")
         error_content = {}
@@ -1636,6 +2057,39 @@ async def list_api_keys(
         )
     except Exception as e:
         logger.error(f"List API keys error: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "error": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+
+@app.get("/api/api-keys/{api_key_id}")
+async def get_api_key(
+    api_key_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get API key details by ID"""
+    try:
+        result = await lead_client.get(f"/api-keys/{api_key_id}")
+        return result
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Lead service error: {e}")
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content=e.response.json() if e.response.content else {"detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Get API key error: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
             content={"detail": "Internal server error", "error": str(e)},
@@ -1958,18 +2412,139 @@ async def list_transactions(
     limit: int = 100,
     current_user: dict = Depends(get_current_user)
 ):
-    """List transactions (requires authentication)"""
-    params = {}
-    if client_id:
-        params["client_id"] = client_id
-    if status:
-        params["status_filter"] = status
-    params["skip"] = skip
-    params["limit"] = limit
-    
+    """List transactions (requires authentication) - automatically filtered to user's connected clients unless cross-client permission"""
     try:
-        result = await client_client.get("/transactions", params=params)
-        return result
+        user_id = current_user.get("user_id")
+        is_admin = current_user.get("is_admin", False)
+        
+        # Admin users can see all transactions
+        if is_admin:
+            params = {}
+            if client_id:
+                params["client_id"] = client_id
+            if status:
+                params["status_filter"] = status
+            params["skip"] = skip
+            params["limit"] = limit
+            
+            result = await client_client.get("/transactions", params=params)
+            return result
+        
+        # Non-admin users: Check if they have cross-client permission
+        async for db in get_db():
+            # Check for special permission to view all transactions across all clients
+            has_cross_client_access = await has_cross_client_permission(
+                user_id=user_id,
+                method="GET",
+                endpoint_path="/api/transactions",
+                db=db
+            )
+            
+            # If user has cross-client permission, return all transactions (like admin)
+            if has_cross_client_access:
+                params = {}
+                if client_id:
+                    params["client_id"] = client_id
+                if status:
+                    params["status_filter"] = status
+                params["skip"] = skip
+                params["limit"] = limit
+                
+                result = await client_client.get("/transactions", params=params)
+                return result
+            
+            # Normal flow: Get their connected client_ids
+            query = select(UserClient).where(
+                and_(
+                    UserClient.user_id == uuid.UUID(user_id),
+                    UserClient.status == "active"
+                )
+            )
+            result = await db.execute(query)
+            user_clients = result.scalars().all()
+            
+            if not user_clients:
+                # User has no connected clients, return empty list
+                return JSONResponse(
+                    content=[],
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                        "Access-Control-Allow-Headers": "*",
+                    }
+                )
+            
+            # Get list of client_ids user is connected to
+            user_client_ids = [uc.client_id for uc in user_clients]
+            
+            # If client_id is provided, verify user has access to it
+            if client_id:
+                if client_id not in user_client_ids:
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "You do not have access to this client's data"},
+                        headers={
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                            "Access-Control-Allow-Headers": "*",
+                        }
+                    )
+                # User has access to this specific client
+                params = {"client_id": client_id}
+            else:
+                # Filter by all user's connected clients
+                # Since transactions endpoint doesn't support multiple client_ids in one call,
+                # we'll need to fetch for each client and combine
+                import asyncio
+                
+                tasks = []
+                for user_client_id in user_client_ids:
+                    params = {"client_id": user_client_id, "limit": 1000}
+                    if status:
+                        params["status_filter"] = status
+                    tasks.append(client_client.get("/transactions", params=params))
+                
+                # Execute all requests in parallel
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Combine transactions from all clients
+                all_transactions = []
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Error fetching transactions: {result}")
+                        continue
+                    if result:
+                        # Handle both array and object responses
+                        transactions = result if isinstance(result, list) else (result.get("data", []) if isinstance(result, dict) else [])
+                        if transactions:
+                            all_transactions.extend(transactions)
+                
+                # Sort by created_at descending (most recent first)
+                all_transactions.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+                
+                # Apply pagination
+                filtered_transactions = all_transactions[skip:skip + limit]
+                
+                return JSONResponse(
+                    content=filtered_transactions,
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                        "Access-Control-Allow-Headers": "*",
+                    }
+                )
+            
+            # Single client access
+            params = {}
+            if client_id:
+                params["client_id"] = client_id
+            if status:
+                params["status_filter"] = status
+            params["skip"] = skip
+            params["limit"] = limit
+            
+            result = await client_client.get("/transactions", params=params)
+            return result
     except httpx.HTTPStatusError as e:
         logger.error(f"Order service error: {e}")
         return JSONResponse(

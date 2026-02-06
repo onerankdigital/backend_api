@@ -1,7 +1,7 @@
 """
 Auth Service - JWT token management and authentication
 """
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -29,7 +29,8 @@ security = HTTPBearer()
 # Database Models
 class User(BaseDBModel):
     __tablename__ = "users"
-    
+
+    name = Column(String, nullable=False)
     email = Column(String, unique=True, nullable=False, index=True)
     password_hash = Column(String, nullable=False)
     is_admin = Column(Boolean, default=False, nullable=False)
@@ -38,6 +39,7 @@ class User(BaseDBModel):
 
 # Pydantic Schemas
 class UserCreate(BaseModel):
+    name: str
     email: EmailStr
     password: str
     is_admin: bool = False
@@ -136,18 +138,20 @@ async def create_user(
     password_hash = hash_password(user_data.password)
     new_user = User(
         id=uuid.uuid4(),
+        name=user_data.name,
         email=user_data.email,
         password_hash=password_hash,
         is_admin=user_data.is_admin,
         status="active"
     )
-    
+
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
-    
+
     return {
         "id": str(new_user.id),
+        "name": new_user.name,
         "email": new_user.email,
         "is_admin": new_user.is_admin,
         "status": new_user.status
@@ -175,10 +179,19 @@ async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
         )
     
     # Create tokens
+    # Normalize is_admin to boolean (database may have it as string "true"/"false")
+    is_admin_bool = False
+    if isinstance(user.is_admin, bool):
+        is_admin_bool = user.is_admin
+    elif isinstance(user.is_admin, str):
+        is_admin_bool = user.is_admin.lower() == "true"
+    else:
+        is_admin_bool = bool(user.is_admin)
+    
     token_data = {
         "user_id": str(user.id),
         "email": user.email,
-        "is_admin": user.is_admin
+        "is_admin": is_admin_bool
     }
     
     access_token = create_access_token(token_data)
@@ -221,10 +234,20 @@ async def refresh_token(request: RefreshTokenRequest):
 @app.get("/me")
 async def get_current_user_info(current_user: User = Depends(get_current_user)):
     """Get current user information"""
+    # Normalize is_admin to boolean (database may have it as string "true"/"false")
+    is_admin_bool = False
+    if isinstance(current_user.is_admin, bool):
+        is_admin_bool = current_user.is_admin
+    elif isinstance(current_user.is_admin, str):
+        is_admin_bool = current_user.is_admin.lower() == "true"
+    else:
+        is_admin_bool = bool(current_user.is_admin)
+    
     return {
         "id": str(current_user.id),
+        "name": current_user.name,
         "email": current_user.email,
-        "is_admin": current_user.is_admin,
+        "is_admin": is_admin_bool,
         "status": current_user.status
     }
 
@@ -263,6 +286,164 @@ async def list_users(
         }
         for user in users
     ]
+
+
+@app.delete("/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a user (admin only) - Admins can delete any user including other admins"""
+    # Check if current user is admin
+    is_admin_bool = False
+    if isinstance(current_user.is_admin, bool):
+        is_admin_bool = current_user.is_admin
+    elif isinstance(current_user.is_admin, str):
+        is_admin_bool = current_user.is_admin.lower() == "true"
+    else:
+        is_admin_bool = bool(current_user.is_admin)
+    
+    if not is_admin_bool:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only administrators can delete users"
+        )
+    
+    # Prevent self-deletion
+    if str(current_user.id) == user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot delete your own account"
+        )
+    
+    # Find the user to delete
+    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user_to_delete = result.scalar_one_or_none()
+    
+    if not user_to_delete:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User {user_id} not found"
+        )
+    
+    # Delete the user (admins can delete any user including other admins)
+    await db.delete(user_to_delete)
+    await db.commit()
+    
+    return {
+        "message": f"User {user_to_delete.email} deleted successfully",
+        "deleted_user_id": str(user_to_delete.id),
+        "was_admin": user_to_delete.is_admin
+    }
+
+
+@app.put("/users/{user_id}")
+async def update_user(
+    user_id: str,
+    name: str = Body(...),
+    email: EmailStr = Body(...),
+    status: str = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Update user details (name, email, status) - Admin only"""
+    # Check if current user is admin
+    if isinstance(current_user.is_admin, bool):
+        is_admin_bool = current_user.is_admin
+    elif isinstance(current_user.is_admin, str):
+        is_admin_bool = current_user.is_admin.lower() == "true"
+    else:
+        is_admin_bool = bool(current_user.is_admin)
+
+    if not is_admin_bool:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only administrators can update users"
+        )
+
+    # Find the user to update
+    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user_to_update = result.scalar_one_or_none()
+
+    if not user_to_update:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User {user_id} not found"
+        )
+
+    # Check if email is being changed to an existing email
+    if email != user_to_update.email:
+        result = await db.execute(select(User).where(User.email == email))
+        existing_user = result.scalar_one_or_none()
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already exists"
+            )
+
+    # Update user fields
+    user_to_update.name = name
+    user_to_update.email = email
+    user_to_update.status = status
+
+    await db.commit()
+    await db.refresh(user_to_update)
+
+    return {
+        "message": "User updated successfully",
+        "user": {
+            "id": str(user_to_update.id),
+            "name": user_to_update.name,
+            "email": user_to_update.email,
+            "status": user_to_update.status,
+            "is_admin": user_to_update.is_admin
+        }
+    }
+
+
+@app.post("/users/{user_id}/change-password")
+async def change_user_password(
+    user_id: str,
+    new_password: str = Body(..., embed=True),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Change a user's password - Admin only"""
+    # Check if current user is admin
+    if isinstance(current_user.is_admin, bool):
+        is_admin_bool = current_user.is_admin
+    elif isinstance(current_user.is_admin, str):
+        is_admin_bool = current_user.is_admin.lower() == "true"
+    else:
+        is_admin_bool = bool(current_user.is_admin)
+
+    if not is_admin_bool:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only administrators can change user passwords"
+        )
+
+    # Find the user
+    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user_to_update = result.scalar_one_or_none()
+
+    if not user_to_update:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User {user_id} not found"
+        )
+
+    # Hash the new password
+    password_hash = hash_password(new_password)
+    user_to_update.password_hash = password_hash
+
+    await db.commit()
+
+    return {
+        "message": "Password changed successfully",
+        "user_id": str(user_to_update.id)
+    }
 
 
 @app.get("/health")

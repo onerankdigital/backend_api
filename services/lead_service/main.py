@@ -129,6 +129,8 @@ class APIKeyCreate(BaseModel):
 
 class APIKeyUpdate(BaseModel):
     status: Optional[str] = None
+    scopes: Optional[List[str]] = None
+    expires_at: Optional[datetime] = None
 
 
 class APIKeyResponse(BaseModel):
@@ -284,8 +286,43 @@ async def update_api_key(
             )
         api_key.status = key_data.status
     
+    if key_data.scopes is not None:
+        api_key.scopes = key_data.scopes
+    
+    if key_data.expires_at is not None:
+        api_key.expires_at = key_data.expires_at
+    
     await db.commit()
     await db.refresh(api_key)
+    
+    return APIKeyResponse(
+        id=str(api_key.id),
+        client_id=api_key.client_id,
+        key_prefix=api_key.key_prefix,
+        scopes=api_key.scopes,
+        status=api_key.status,
+        expires_at=api_key.expires_at,
+        last_used_at=api_key.last_used_at,
+        created_at=api_key.created_at
+    )
+
+
+@app.get("/api-keys/{api_key_id}", response_model=APIKeyResponse)
+async def get_api_key(
+    api_key_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get API key details by ID"""
+    result = await db.execute(
+        select(ClientAPIKey).where(ClientAPIKey.id == uuid.UUID(api_key_id))
+    )
+    api_key = result.scalar_one_or_none()
+    
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"API key with id '{api_key_id}' not found"
+        )
     
     return APIKeyResponse(
         id=str(api_key.id),
@@ -306,7 +343,7 @@ async def delete_api_key(
 ):
     """Delete API key permanently"""
     result = await db.execute(
-        select(ClientAPIKey).where(ClientAPIKey.id == api_key_id)
+        select(ClientAPIKey).where(ClientAPIKey.id == uuid.UUID(api_key_id))
     )
     api_key = result.scalar_one_or_none()
     

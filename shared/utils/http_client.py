@@ -123,20 +123,30 @@ class ServiceClient:
         json: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None
     ) -> Optional[Dict[str, Any]]:
-        """DELETE request"""
+        """DELETE request with JSON body support"""
         url = f"{self.base_url}{path}"
         try:
-            # httpx.delete() doesn't accept 'data' parameter, only 'json'
-            # If data is provided, use it as json
             request_json = json if json is not None else data
-            # Build kwargs - only include json and headers if they're not None
-            kwargs = {}
+
             if request_json is not None:
-                kwargs["json"] = request_json
-            if headers is not None:
-                kwargs["headers"] = headers
-            response = await self.client.delete(url, **kwargs)
+                # httpx.delete() doesn't accept json/content in some versions
+                # Use request() method for full control
+                import json as json_module
+                request_headers = headers or {}
+                request_headers["Content-Type"] = "application/json"
+
+                response = await self.client.request(
+                    method="DELETE",
+                    url=url,
+                    content=json_module.dumps(request_json),
+                    headers=request_headers
+                )
+            else:
+                # No body, use standard delete
+                response = await self.client.delete(url, headers=headers)
+
             response.raise_for_status()
+
             # For 204 No Content, return None instead of trying to parse JSON
             if response.status_code == 204:
                 return None

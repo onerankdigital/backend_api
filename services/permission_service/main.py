@@ -3,7 +3,7 @@ Permission Service - Dynamic role & permission management
 """
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, delete
 from pydantic import BaseModel, field_validator, field_serializer
 from typing import Optional, List
 from datetime import datetime
@@ -14,8 +14,8 @@ import uuid
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from shared.database import get_db
-from shared.models.base import BaseModel as BaseDBModel
+from shared.database import get_db, Base
+from shared.models.base import BaseModel as BaseDBModel, BaseModelNoID
 from sqlalchemy import Column, String, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -52,12 +52,12 @@ class Permission(BaseDBModel):
     )
 
 
-class RolePermission(BaseDBModel):
+class RolePermission(Base):
     __tablename__ = "role_permissions"
-    
+
     role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False, primary_key=True)
     permission_id = Column(UUID(as_uuid=True), ForeignKey("permissions.id"), nullable=False, primary_key=True)
-    
+
     __table_args__ = (
         {"comment": "Many-to-many relationship between roles and permissions"}
     )
@@ -360,6 +360,7 @@ async def remove_permission_from_role(
     db: AsyncSession = Depends(get_db)
 ):
     """Remove permission from role"""
+    # Check if assignment exists
     result = await db.execute(
         select(RolePermission).where(
             and_(
@@ -369,16 +370,24 @@ async def remove_permission_from_role(
         )
     )
     assignment_obj = result.scalar_one_or_none()
-    
+
     if not assignment_obj:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Permission not assigned to role"
         )
-    
-    await db.delete(assignment_obj)
+
+    # Delete the assignment
+    await db.execute(
+        delete(RolePermission).where(
+            and_(
+                RolePermission.role_id == uuid.UUID(assignment.role_id),
+                RolePermission.permission_id == uuid.UUID(assignment.permission_id)
+            )
+        )
+    )
     await db.commit()
-    
+
     return None
 
 

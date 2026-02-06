@@ -35,21 +35,23 @@ JWT_REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", 7
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Create JWT access token"""
+    """Create JWT access token - long-lived unless explicitly logged out"""
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
-    
+        # Set to 10 years for persistent login (only logout on explicit action)
+        expire = datetime.utcnow() + timedelta(days=3650)
+
     to_encode.update({"exp": expire, "type": "access"})
     return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 
 def create_refresh_token(data: dict) -> str:
-    """Create JWT refresh token"""
+    """Create JWT refresh token - long-lived unless explicitly logged out"""
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+    # Set to 10 years for persistent login (only logout on explicit action)
+    expire = datetime.utcnow() + timedelta(days=3650)
     to_encode.update({"exp": expire, "type": "refresh"})
     return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
