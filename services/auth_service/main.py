@@ -409,7 +409,7 @@ async def change_user_password(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Change a user's password - Admin only"""
+    """Change a user's password - Users can change their own password, admins can change any password"""
     # Check if current user is admin
     if isinstance(current_user.is_admin, bool):
         is_admin_bool = current_user.is_admin
@@ -417,12 +417,6 @@ async def change_user_password(
         is_admin_bool = current_user.is_admin.lower() == "true"
     else:
         is_admin_bool = bool(current_user.is_admin)
-
-    if not is_admin_bool:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only administrators can change user passwords"
-        )
 
     # Find the user
     result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
@@ -432,6 +426,13 @@ async def change_user_password(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User {user_id} not found"
+        )
+
+    # Allow if: 1) User is admin, OR 2) User is changing their own password
+    if not is_admin_bool and str(current_user.id) != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only change your own password. Administrators can change any user's password."
         )
 
     # Hash the new password

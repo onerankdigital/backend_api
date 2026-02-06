@@ -573,6 +573,12 @@ async def permission_middleware(request: Request, call_next):
     if request.url.path == "/api/auth/me/permissions":
         return await call_next(request)
     
+    # Allow self-service password changes (users changing their own password)
+    # The auth service endpoint will validate that users can only change their own password
+    # Admins can change any password (checked in auth service)
+    if request.url.path.startswith("/api/auth/users/") and request.url.path.endswith("/change-password") and request.method == "POST":
+        return await call_next(request)
+    
     # Check authentication (auth_header already checked above for public endpoints)
     if not auth_header:
         # Allow API key authentication for lead ingestion

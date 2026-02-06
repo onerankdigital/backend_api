@@ -66,8 +66,8 @@ class UserClient(BaseDBModel):
     __tablename__ = "user_clients"
     
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
-    client_id = Column(String, ForeignKey("clients.client_id"), nullable=False, index=True)
-    role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False)
+    client_id = Column(String, ForeignKey("clients.client_id"), nullable=True, index=True)
+    role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id"), nullable=True)
     reports_to_user_client_id = Column(UUID(as_uuid=True), ForeignKey("user_clients.id"), nullable=True)
     status = Column(String, default="active", nullable=False)
     
@@ -79,8 +79,8 @@ class UserClient(BaseDBModel):
 # Pydantic Schemas
 class UserClientCreate(BaseModel):
     user_id: str
-    client_id: str
-    role_id: str
+    client_id: Optional[str] = None
+    role_id: Optional[str] = None
     reports_to_user_client_id: Optional[str] = None
     status: str = "active"
 
@@ -94,8 +94,8 @@ class UserClientUpdate(BaseModel):
 class UserClientResponse(BaseModel):
     id: str
     user_id: str
-    client_id: str
-    role_id: str
+    client_id: Optional[str] = None
+    role_id: Optional[str] = None
     reports_to_user_client_id: Optional[str] = None
     status: str
     created_at: datetime
@@ -119,10 +119,10 @@ class UserClientsResponse(BaseModel):
     id: str
     user_id: str
     email: str
-    client_id: str
-    client_name: str
-    role_id: str
-    role_name: str
+    client_id: Optional[str] = None
+    client_name: Optional[str] = None
+    role_id: Optional[str] = None
+    role_name: Optional[str] = None
     reports_to_user_client_id: Optional[str] = None
     status: str
     
@@ -143,7 +143,7 @@ async def create_user_client(
     user_client_data: UserClientCreate,
     db: AsyncSession = Depends(get_db)
 ):
-    """Assign user to client with role"""
+    """Assign user to client with role. Both client_id and role_id are optional and independent."""
     # Validate user exists
     result = await db.execute(
         select(User).where(User.id == uuid.UUID(user_client_data.user_id))
@@ -155,44 +155,51 @@ async def create_user_client(
             detail=f"User {user_client_data.user_id} not found"
         )
     
-    # Validate client exists
-    result = await db.execute(
-        select(Client).where(Client.client_id == user_client_data.client_id)
-    )
-    client = result.scalar_one_or_none()
-    if not client:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Client {user_client_data.client_id} not found"
+    # Validate client exists if provided
+    client_id = None
+    if user_client_data.client_id:
+        result = await db.execute(
+            select(Client).where(Client.client_id == user_client_data.client_id)
         )
+        client = result.scalar_one_or_none()
+        if not client:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Client {user_client_data.client_id} not found"
+            )
+        client_id = user_client_data.client_id
     
-    # Validate role exists
-    result = await db.execute(
-        select(Role).where(Role.id == uuid.UUID(user_client_data.role_id))
-    )
-    role = result.scalar_one_or_none()
-    if not role:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Role {user_client_data.role_id} not found"
+    # Validate role exists if provided
+    role_id = None
+    if user_client_data.role_id:
+        result = await db.execute(
+            select(Role).where(Role.id == uuid.UUID(user_client_data.role_id))
         )
+        role = result.scalar_one_or_none()
+        if not role:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Role {user_client_data.role_id} not found"
+            )
+        role_id = uuid.UUID(user_client_data.role_id)
     
-    # Check if user-client relationship already exists
-    result = await db.execute(
-        select(UserClient).where(
-            and_(
-                UserClient.user_id == uuid.UUID(user_client_data.user_id),
-                UserClient.client_id == user_client_data.client_id,
-                UserClient.status != "deleted"
+    # Check if user-client relationship already exists (only if client is provided)
+    if client_id:
+        result = await db.execute(
+            select(UserClient).where(
+                and_(
+                    UserClient.user_id == uuid.UUID(user_client_data.user_id),
+                    UserClient.client_id == client_id,
+                    UserClient.status != "deleted"
+                )
             )
         )
-    )
-    existing = result.scalar_one_or_none()
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User already assigned to this client"
-        )
+        existing = result.scalar_one_or_none()
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User already assigned to this client"
+            )
     
     # Validate reports_to if provided
     reports_to_id = None
@@ -212,8 +219,8 @@ async def create_user_client(
     try:
         new_user_client = UserClient(
             user_id=uuid.UUID(user_client_data.user_id),
-            client_id=user_client_data.client_id,
-            role_id=uuid.UUID(user_client_data.role_id),
+            client_id=client_id,
+            role_id=role_id,
             reports_to_user_client_id=reports_to_id,
             status=user_client_data.status
         )
@@ -274,9 +281,9 @@ async def list_user_clients(
         Role.name.label("role_name")
     ).join(
         User, UserClient.user_id == User.id
-    ).join(
+    ).outerjoin(
         Client, UserClient.client_id == Client.client_id
-    ).join(
+    ).outerjoin(
         Role, UserClient.role_id == Role.id
     )
     
@@ -297,7 +304,7 @@ async def list_user_clients(
             email=row.email,
             client_id=row.UserClient.client_id,
             client_name=row.client_name,
-            role_id=str(row.UserClient.role_id),
+            role_id=str(row.UserClient.role_id) if row.UserClient.role_id else None,
             role_name=row.role_name,
             reports_to_user_client_id=str(row.UserClient.reports_to_user_client_id) if row.UserClient.reports_to_user_client_id else None,
             status=row.UserClient.status
@@ -368,7 +375,7 @@ async def get_user_clients(
     """Get all clients for a user"""
     result = await db.execute(
         select(UserClient, Client.name)
-        .join(Client, UserClient.client_id == Client.client_id)
+        .outerjoin(Client, UserClient.client_id == Client.client_id)
         .where(
             and_(
                 UserClient.user_id == uuid.UUID(user_id),
@@ -383,7 +390,7 @@ async def get_user_clients(
             "client_id": row.UserClient.client_id,
             "client_name": row.name,
             "user_client_id": str(row.UserClient.id),
-            "role_id": str(row.UserClient.role_id)
+            "role_id": str(row.UserClient.role_id) if row.UserClient.role_id else None
         }
         for row in rows
     ]
