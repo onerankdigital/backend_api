@@ -186,6 +186,76 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         raise HTTPException(status_code=401, detail=str(e))
 
 
+def normalize_path_for_matching(path: str) -> str:
+    """
+    Normalize a path for permission matching by:
+    1. Replacing any path parameter values (UUIDs, numbers, strings) with {id}
+    2. Replacing any path parameter names ({client_id}, {user_id}, etc.) with {id}
+    
+    Examples:
+    - /api/clients/ORD-20260211-001 -> /api/clients/{id}
+    - /api/clients/{client_id} -> /api/clients/{id}
+    - /api/clients/123e4567-e89b-12d3-a456-426614174000 -> /api/clients/{id}
+    - /api/clients/ORD-20260211-001/balance -> /api/clients/{id}/balance
+    """
+    import re
+    if not path:
+        return path
+    
+    normalized = path
+    
+    # First, replace any path parameter names (like {client_id}, {user_id}) with {id}
+    # This handles permission paths that already have parameter placeholders
+    normalized = re.sub(r'\{[^}]+\}', '{id}', normalized)
+    
+    # If the path already has {id} placeholders, we're done (it's a permission path, not a request path)
+    if '{id}' in normalized:
+        return normalized
+    
+    # For request paths, replace actual parameter values
+    # Known endpoint names and path prefixes that should NOT be replaced
+    known_endpoints = ('leads', 'clients', 'transactions', 'users', 'roles', 'permissions',
+                      'products', 'industries', 'about-us', 'contact-details', 'api-keys',
+                      'user-clients', 'endpoints', 'search', 'captcha', 'csrf', 'token',
+                      'balance', 'integrations', 'all', 'me', 'login', 'refresh', 'logout',
+                      'change-password', 'permissions', 'auth', 'api')
+    
+    # Split path into segments
+    segments = normalized.split('/')
+    
+    # Process segments from right to left, replacing ID-like segments
+    # We skip the first segment (usually empty) and common path prefixes
+    for i in range(len(segments) - 1, 0, -1):  # Start from end, skip index 0 (empty segment)
+        segment = segments[i]
+        
+        # Skip empty segments, known endpoints, and already normalized segments
+        if not segment or segment in known_endpoints or segment == '{id}' or '{' in segment:
+            continue
+        
+        # Check if segment looks like an ID:
+        # - UUID format: 8-4-4-4-12 hex digits
+        # - Numeric: pure numbers
+        # - Alphanumeric with dashes/underscores (like ORD-20260211-001)
+        # But exclude single-letter or very short segments that are likely endpoint names
+        is_uuid = bool(re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', segment, re.IGNORECASE))
+        is_numeric = bool(re.match(r'^\d+$', segment))
+        # For ID-like patterns, require at least 3 characters to avoid matching short endpoint names
+        is_id_like = bool(re.match(r'^[a-zA-Z0-9_-]{3,}$', segment))
+        
+        if is_uuid or is_numeric or is_id_like:
+            segments[i] = '{id}'
+            # Continue to replace all ID-like segments (not just the last one)
+            # This handles cases like /api/clients/ORD-20260211-001/balance where we want to replace ORD-20260211-001
+    
+    normalized = '/'.join(segments)
+    
+    # Debug logging (can be removed after verification)
+    if path != normalized:
+        logger.debug(f"Path normalized: '{path}' -> '{normalized}'")
+    
+    return normalized
+
+
 async def has_cross_client_permission(
     user_id: str,
     method: str,
@@ -316,23 +386,32 @@ async def check_access_decision(
     has_permission = False
     requester_user_client_id = None
     
+    # Normalize the request path for matching
+    normalized_request_path = normalize_path_for_matching(path)
+    
     for uc in user_clients:
         requester_user_client_id = str(uc.id)
-        # Get permissions for this role
+        # Get all permissions for this role with matching method
         result = await db.execute(
             select(Permission)
             .join(RolePermission, Permission.id == RolePermission.permission_id)
             .where(
                 and_(
                     RolePermission.role_id == uc.role_id,
-                    Permission.method == method.upper(),
-                    Permission.path == path
+                    Permission.method == method.upper()
                 )
             )
         )
-        permission = result.scalar_one_or_none()
-        if permission:
-            has_permission = True
+        permissions = result.scalars().all()
+        
+        # Check each permission by comparing normalized paths
+        for permission in permissions:
+            normalized_permission_path = normalize_path_for_matching(permission.path)
+            if normalized_permission_path == normalized_request_path:
+                has_permission = True
+                break
+        
+        if has_permission:
             break
     
     if not has_permission:
@@ -651,25 +730,12 @@ async def permission_middleware(request: Request, call_next):
         # Get client_id from query params only (don't read body here as it can only be read once)
         client_id = request.query_params.get("client_id")
         
-        # Normalize path for permission matching (same logic as permission_registry.py)
-        # Convert path parameters to {id} format for matching
-        # e.g., /api/clients/123e4567-e89b-12d3-a456-426614174000 -> /api/clients/{id}
-        import re
+        # Normalize path for permission matching using the centralized normalization function
         path = request.url.path
-        normalized_path = path
-
-        # Only normalize if the path contains actual ID values (UUIDs or numeric IDs)
-        # Replace UUID patterns with {id}
-        normalized_path = re.sub(r'/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', '/{id}', normalized_path)
-
-        # Replace numeric IDs at the end (e.g., /api/clients/123 -> /api/clients/{id})
-        # But NOT plain words like /api/leads or /api/clients
-        # Only match if the last segment is purely numeric or looks like an ID
-        if not normalized_path.endswith(('leads', 'clients', 'transactions', 'users', 'roles', 'permissions',
-                                          'products', 'industries', 'about-us', 'contact-details', 'api-keys',
-                                          'user-clients', 'endpoints', 'search', 'captcha', 'csrf', 'token')):
-            # Replace last segment with {id} if it's numeric or UUID-like
-            normalized_path = re.sub(r'/(\d+|[a-f0-9-]{36})$', '/{id}', normalized_path)
+        normalized_path = normalize_path_for_matching(path)
+        # Log normalization for debugging
+        if path != normalized_path:
+            logger.debug(f"Path normalized: {path} -> {normalized_path}")
         method = request.method
         
         # Get database session for permission checking
@@ -734,33 +800,48 @@ async def permission_middleware(request: Request, call_next):
                 else:
                     # Check if any of the user's roles have permission for this endpoint
                     has_access = False
+                    # normalized_path is already normalized from line 712, but ensure it's properly normalized
+                    normalized_request_path = normalized_path
+                    
                     for uc in user_clients:
-                        logger.info(f"Checking role {uc.role_id} for permission {method} {normalized_path}")
+                        logger.info(f"Checking role {uc.role_id} for permission {method} {normalized_path} (normalized: {normalized_request_path})")
 
-                        # Check for exact match OR cross-client variant (/api/leads or /api/leads/all)
-                        cross_client_path = f"{normalized_path}/all"
-
+                        # Get all permissions for this role with matching method
                         result = await db.execute(
                             select(Permission)
                             .join(RolePermission, Permission.id == RolePermission.permission_id)
                             .where(
                                 and_(
                                     RolePermission.role_id == uc.role_id,
-                                    Permission.method == method.upper(),
-                                    or_(
-                                        Permission.path == normalized_path,
-                                        Permission.path == cross_client_path
-                                    )
+                                    Permission.method == method.upper()
                                 )
                             )
                         )
-                        permission = result.scalar_one_or_none()
-                        if permission:
-                            logger.info(f"Permission found: {permission.method} {permission.path} for role {uc.role_id}")
-                            has_access = True
+                        permissions = result.scalars().all()
+                        
+                        # Check each permission by comparing normalized paths
+                        for permission in permissions:
+                            # Normalize the permission path for comparison
+                            normalized_permission_path = normalize_path_for_matching(permission.path)
+                            
+                            # Check for exact match with normalized paths
+                            if normalized_permission_path == normalized_request_path:
+                                logger.info(f"Permission found: {permission.method} {permission.path} (normalized: {normalized_permission_path}) for role {uc.role_id}")
+                                has_access = True
+                                break
+                            
+                            # Check for cross-client variant
+                            cross_client_path = f"{normalized_request_path}/all"
+                            if normalized_permission_path == cross_client_path:
+                                logger.info(f"Permission found (cross-client): {permission.method} {permission.path} for role {uc.role_id}")
+                                has_access = True
+                                break
+                        
+                        if has_access:
                             break
-                        else:
-                            logger.warning(f"No permission {method} {normalized_path} or {cross_client_path} found for role {uc.role_id}")
+                        
+                        if not has_access:
+                            logger.warning(f"No permission {method} {normalized_request_path} or {normalized_request_path}/all found for role {uc.role_id}")
                 
                 if not has_access:
                     # Log all permissions for this role for debugging
