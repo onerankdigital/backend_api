@@ -867,6 +867,47 @@ async def export_client_data(client_id: str, db: AsyncSession = Depends(get_db))
     }
 
 
+@app.get("/clients/export-all-data")
+async def export_all_clients_data(db: AsyncSession = Depends(get_db)):
+    """Export all clients and all rows from tables linked by client_id."""
+    tables_result = await db.execute(text("""
+        SELECT table_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND column_name = 'client_id'
+        ORDER BY table_name
+    """))
+    table_names = [row[0] for row in tables_result.fetchall()]
+
+    clients_result = await db.execute(select(Client))
+    clients = clients_result.scalars().all()
+    clients_serialized = [serialize_model(client) for client in clients]
+
+    related_data: Dict[str, List[Dict[str, Any]]] = {}
+    total_related_records = 0
+
+    for table_name in table_names:
+        query = text(f'SELECT * FROM "{table_name}"')
+        rows_result = await db.execute(query)
+        rows = rows_result.mappings().all()
+        serialized_rows = [
+            {k: serialize_value(v) for k, v in row.items()}
+            for row in rows
+        ]
+        related_data[table_name] = serialized_rows
+        total_related_records += len(serialized_rows)
+
+    return {
+        "exported_at": datetime.utcnow().isoformat(),
+        "clients": clients_serialized,
+        "related_tables": related_data,
+        "summary": {
+            "clients_count": len(clients_serialized),
+            "tables_with_client_id": len(table_names),
+            "related_records": total_related_records
+        }
+    }
+
+
 # Order Form Submission
 @app.post("/orders/submit", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
 async def submit_order(

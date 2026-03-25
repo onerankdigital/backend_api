@@ -1607,6 +1607,53 @@ async def export_client_data(
         )
 
 
+@app.get("/api/clients/export-all-data")
+async def export_all_clients_data(
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Export all clients and client-linked records (admin only)."""
+    if not is_admin_user(current_user):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Only administrators can export all client data"},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+    try:
+        auth_header = request.headers.get("Authorization", "")
+        return await client_client.get(
+            "/clients/export-all-data",
+            headers={"Authorization": auth_header} if auth_header else None
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"All clients export service error: {e}")
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content=e.response.json() if e.response.content else {"detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Export all clients data error: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "error": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+
 @app.get("/api/clients/{client_id}")
 async def get_client(client_id: str):
     """Get client (public endpoint for ordpanel)"""
