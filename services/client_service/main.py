@@ -908,9 +908,9 @@ async def export_all_clients_data(db: AsyncSession = Depends(get_db)):
     }
 
 
-@app.get("/clients/all/export-data")
+@app.get("/exports/clients/all-data")
 async def export_all_clients_data_v2(db: AsyncSession = Depends(get_db)):
-    """Export all clients and all rows from tables linked by client_id (non-conflicting path)."""
+    """Export all clients and all rows from tables linked by client_id."""
     return await export_all_clients_data(db)
 
 
