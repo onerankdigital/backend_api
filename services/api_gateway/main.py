@@ -186,6 +186,16 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         raise HTTPException(status_code=401, detail=str(e))
 
 
+def is_admin_user(user: dict) -> bool:
+    """Normalize admin flag from JWT payload."""
+    value = user.get("is_admin", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower().strip() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
 def normalize_path_for_matching(path: str) -> str:
     """
     Normalize a path for permission matching by:
@@ -1538,6 +1548,54 @@ async def list_clients(current_user: dict = Depends(get_current_user)):
         )
     except Exception as e:
         logger.error(f"List clients error: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "error": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+
+@app.get("/api/clients/{client_id}/export-data")
+async def export_client_data(
+    client_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Export all client-related records (admin only)."""
+    if not is_admin_user(current_user):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Only administrators can export full client data"},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+    try:
+        auth_header = request.headers.get("Authorization", "")
+        return await client_client.get(
+            f"/clients/{client_id}/export-data",
+            headers={"Authorization": auth_header} if auth_header else None
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Client export service error: {e}")
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content=e.response.json() if e.response.content else {"detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Export client data error: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
             content={"detail": "Internal server error", "error": str(e)},
@@ -3209,10 +3267,25 @@ async def create_permission(request: Request, current_user: dict = Depends(get_c
 
 
 @app.get("/api/permissions")
-async def list_permissions(current_user: dict = Depends(get_current_user)):
-    """List permissions"""
+async def list_permissions(
+    module: Optional[str] = None,
+    action_type: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """List permissions with optional filters"""
     try:
-        result = await permission_client.get("/permissions")
+        params = {}
+        if module:
+            params["module"] = module
+        if action_type:
+            params["action_type"] = action_type
+        
+        url = "/permissions"
+        if params:
+            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+            url = f"{url}?{query_string}"
+        
+        result = await permission_client.get(url)
         return result
     except httpx.HTTPStatusError as e:
         logger.error(f"Permission service error: {e}")
@@ -3324,6 +3397,80 @@ async def remove_permission_from_role(request: Request, current_user: dict = Dep
 async def get_role_permissions(role_id: str, current_user: dict = Depends(get_current_user)):
     """Get permissions for a role"""
     return await permission_client.get(f"/roles/{role_id}/permissions")
+
+
+@app.get("/api/roles/{role_id}/permissions/summary")
+async def get_role_permissions_summary(role_id: str, current_user: dict = Depends(get_current_user)):
+    """Get permission summary for a role"""
+    try:
+        return await permission_client.get(f"/roles/{role_id}/permissions/summary")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Permission service error: {e}")
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content=e.response.json() if e.response.content else {"detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+
+@app.post("/api/role-permissions/bulk")
+async def bulk_assign_permissions(request: Request, current_user: dict = Depends(get_current_user)):
+    """Bulk assign or remove permissions from a role"""
+    body = await request.json()
+    try:
+        return await permission_client.post("/role-permissions/bulk", json=body)
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Permission service error: {e}")
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content=e.response.json() if e.response.content else {"detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+
+@app.post("/api/role-permissions/by-module")
+async def assign_permissions_by_module(request: Request, current_user: dict = Depends(get_current_user)):
+    """Assign permissions to a role based on module and actions"""
+    body = await request.json()
+    try:
+        return await permission_client.post("/role-permissions/by-module", json=body)
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Permission service error: {e}")
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content=e.response.json() if e.response.content else {"detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+
+
+@app.get("/api/permissions/by-module/{module}")
+async def get_permissions_by_module(module: str, current_user: dict = Depends(get_current_user)):
+    """Get all permissions for a specific module"""
+    try:
+        return await permission_client.get(f"/permissions/by-module/{module}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Permission service error: {e}")
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content=e.response.json() if e.response.content else {"detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
 
 
 # User-Client routes (proxy to user service)

@@ -4,7 +4,7 @@ Client Service - Client management with client-provided IDs
 from fastapi import FastAPI, Depends, HTTPException, status, Header, UploadFile, File, Form, Request
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, text
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime, date
@@ -385,6 +385,36 @@ async def get_client_services(client_id: str, db: AsyncSession) -> List[Dict[str
             services_list.append(service_info)
     
     return services_list
+
+
+def serialize_value(value: Any) -> Any:
+    """Convert database values to JSON-safe primitives."""
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return value.hex()
+    if isinstance(value, dict):
+        return {k: serialize_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [serialize_value(v) for v in value]
+    return value
+
+
+def serialize_model(instance: Any) -> Dict[str, Any]:
+    """Serialize a SQLAlchemy model instance using table columns."""
+    return {
+        column.name: serialize_value(getattr(instance, column.name))
+        for column in instance.__table__.columns
+    }
 
 
 def enrich_client_response(client: Client, services_list: List[Dict[str, Any]]) -> ClientResponse:
@@ -789,6 +819,52 @@ async def get_client(client_id: str, db: AsyncSession = Depends(get_db)):
     
     # Create response with services included in order_data
     return enrich_client_response(client, services_list)
+
+
+@app.get("/clients/{client_id}/export-data")
+async def export_client_data(client_id: str, db: AsyncSession = Depends(get_db)):
+    """Export all database rows linked to a client_id as JSON."""
+    client_result = await db.execute(select(Client).where(Client.client_id == client_id))
+    client = client_result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Client with client_id '{client_id}' not found"
+        )
+
+    # Discover all tables that have a client_id column and export matching rows.
+    tables_result = await db.execute(text("""
+        SELECT table_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND column_name = 'client_id'
+        ORDER BY table_name
+    """))
+    table_names = [row[0] for row in tables_result.fetchall()]
+
+    related_data: Dict[str, List[Dict[str, Any]]] = {}
+    total_related_records = 0
+
+    for table_name in table_names:
+        query = text(f'SELECT * FROM "{table_name}" WHERE client_id = :client_id')
+        rows_result = await db.execute(query, {"client_id": client_id})
+        rows = rows_result.mappings().all()
+        serialized_rows = [
+            {k: serialize_value(v) for k, v in row.items()}
+            for row in rows
+        ]
+        related_data[table_name] = serialized_rows
+        total_related_records += len(serialized_rows)
+
+    return {
+        "client_id": client_id,
+        "exported_at": datetime.utcnow().isoformat(),
+        "client": serialize_model(client),
+        "related_tables": related_data,
+        "summary": {
+            "tables_with_client_id": len(table_names),
+            "related_records": total_related_records
+        }
+    }
 
 
 # Order Form Submission

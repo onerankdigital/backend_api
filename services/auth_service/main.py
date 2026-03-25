@@ -45,6 +45,13 @@ class UserCreate(BaseModel):
     is_admin: bool = False
 
 
+class UserUpdate(BaseModel):
+    name: str
+    email: EmailStr
+    status: str
+    is_admin: Optional[bool] = None
+
+
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
@@ -341,13 +348,11 @@ async def delete_user(
 @app.put("/users/{user_id}")
 async def update_user(
     user_id: str,
-    name: str = Body(...),
-    email: EmailStr = Body(...),
-    status: str = Body(...),
+    user_data: UserUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Update user details (name, email, status) - Admin only"""
+    """Update user details (name, email, status, is_admin) - Admin only"""
     # Check if current user is admin
     if isinstance(current_user.is_admin, bool):
         is_admin_bool = current_user.is_admin
@@ -373,8 +378,8 @@ async def update_user(
         )
 
     # Check if email is being changed to an existing email
-    if email != user_to_update.email:
-        result = await db.execute(select(User).where(User.email == email))
+    if user_data.email != user_to_update.email:
+        result = await db.execute(select(User).where(User.email == user_data.email))
         existing_user = result.scalar_one_or_none()
         if existing_user:
             raise HTTPException(
@@ -383,9 +388,13 @@ async def update_user(
             )
 
     # Update user fields
-    user_to_update.name = name
-    user_to_update.email = email
-    user_to_update.status = status
+    user_to_update.name = user_data.name
+    user_to_update.email = user_data.email
+    user_to_update.status = user_data.status
+    
+    # Update is_admin if provided (explicitly check for None to allow False)
+    if user_data.is_admin is not None:
+        user_to_update.is_admin = user_data.is_admin
 
     await db.commit()
     await db.refresh(user_to_update)
