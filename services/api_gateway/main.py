@@ -1627,7 +1627,7 @@ async def export_all_clients_data(
     try:
         auth_header = request.headers.get("Authorization", "")
         return await client_client.get(
-            "/clients/export-all-data",
+            "/clients/all/export-data",
             headers={"Authorization": auth_header} if auth_header else None
         )
     except httpx.HTTPStatusError as e:

@@ -908,6 +908,12 @@ async def export_all_clients_data(db: AsyncSession = Depends(get_db)):
     }
 
 
+@app.get("/clients/all/export-data")
+async def export_all_clients_data_v2(db: AsyncSession = Depends(get_db)):
+    """Export all clients and all rows from tables linked by client_id (non-conflicting path)."""
+    return await export_all_clients_data(db)
+
+
 # Order Form Submission
 @app.post("/orders/submit", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
 async def submit_order(
